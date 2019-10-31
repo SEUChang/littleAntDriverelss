@@ -21,7 +21,7 @@
 #include <little_ant_msgs/ControlCmd1.h>
 #include <little_ant_msgs/ControlCmd2.h>
 
-#include<state_detection/state_detection.h>
+#include<ant_math/ant_math.h>
 
 #define ID_CMD_1 0x2C5
 #define	ID_CMD_2 0x1C5
@@ -31,7 +31,10 @@
 #define ID_STATE3 0x4D1
 #define ID_STATE4 0x1D5
 
+#ifndef MAX_SPEED
 #define MAX_SPEED 30.0
+#endif
+
 
 #ifndef PACK
 #define PACK( __Declaration__ ) __Declaration__ __attribute__((__packed__))
@@ -56,6 +59,8 @@ typedef struct
 	uint8_t id;
 	uint8_t is_start :1;
 	uint8_t is_emergency_brake :1;
+	uint8_t key1 :1;
+	uint8_t key2 :1;
 	uint8_t reserved;
 	uint8_t checkNum;
 	
@@ -81,8 +86,8 @@ public:
 	
 private:
 	void Stm32BufferIncomingData(unsigned char *message, unsigned int length);
-	void parse_stm32_msgs(unsigned char *msg);
-	uint8_t generateCheckNum(const uint8_t* ptr,size_t len);
+	void parse_stm32_msgs();
+	uint8_t generateCheckNum(const void* voidPtr,size_t len);
 	void setDriverlessMode();
 	void exitDriverlessMode();
 	
@@ -90,7 +95,7 @@ private:
 	Can2serial can2serial;
 	serial::Serial * stm32_serial_port_;
 	
-	stm32Msg1_t stm32_msg1_;
+	const stm32Msg1_t *stm32_msg1Ptr_;
 	
 	bool is_driverlessMode_;
 	
@@ -121,6 +126,7 @@ private:
 	little_ant_msgs::State4 state4;
 	
 	boost::mutex mutex_;
+	bool key1,key2;
 
 };
 

@@ -1,7 +1,7 @@
 #include<base_control/base_control.h>
 #include<assert.h>
 
-using namespace state_detection;
+static float g_steering_gearRatio = 540.0/25.0;
 
 static bool openSerial(serial::Serial* & port_ptr, std::string port_name,int baud_rate)
 {
@@ -35,10 +35,10 @@ static bool openSerial(serial::Serial* & port_ptr, std::string port_name,int bau
 	}
 	
 	return true;
-
 }
 
-BaseControl::BaseControl()
+BaseControl::BaseControl():
+	stm32_msg1Ptr_((const stm32Msg1_t *)stm32_pkg_buf)
 {
 	is_driverlessMode_ = false;
 	stm32_serial_port_ = NULL;
@@ -75,19 +75,17 @@ bool BaseControl::init(int argc,char**argv)
 	ros::NodeHandle nh;
 	ros::NodeHandle nh_private("~");
 	
-	state_detection::debugSystemInitial();
-	
 	nh_private.param<std::string>("obd_can_port_name", obd_can_port_name_, "");
 	nh_private.param<std::string>("stm32_port_name", stm32_port_name_, "");
-	nh_private.param<float>("max_steering_speed",max_steering_speed_,5.0);
+	nh_private.param<float>("max_steering_speed",max_steering_speed_,2.0);
 	nh_private.param<int>("stm32_baudrate",stm32_baudrate_,115200);
 	
 	
 	assert(!obd_can_port_name_.empty() && !stm32_port_name_.empty());
 	assert(max_steering_speed_>0);
 	
-	cmd1_sub = nh.subscribe("/controlCmd1",10,&BaseControl::callBack1,this);
-	cmd2_sub = nh.subscribe("/controlCmd2",10,&BaseControl::callBack2,this);
+	cmd1_sub = nh.subscribe("/controlCmd1",1,&BaseControl::callBack1,this);
+	cmd2_sub = nh.subscribe("/controlCmd2",1,&BaseControl::callBack2,this);
 	
 	state1_pub = nh.advertise<little_ant_msgs::State1>("vehicleState1",10);
 	state2_pub = nh.advertise<little_ant_msgs::State2>("vehicleState2",10);
@@ -104,19 +102,17 @@ bool BaseControl::init(int argc,char**argv)
 	}
 	else
 		ROS_INFO("open port %s successfully",obd_can_port_name_.c_str());
-	/*
+	
 	can2serial.clearCanFilter();
 	
-	can2serial.setCanFilter_alone(0x01,ID_STATE1); usleep(10000);
-	can2serial.setCanFilter_alone(0x02,ID_STATE2); usleep(10000);
-	can2serial.setCanFilter_alone(0x03,ID_STATE3); usleep(10000);
-	can2serial.setCanFilter_alone(0x04,ID_STATE4); usleep(10000);
+//	can2serial.setCanFilter_alone(0x01,ID_STATE1); usleep(10000);
+//	can2serial.setCanFilter_alone(0x02,ID_STATE2); usleep(10000);
+//	can2serial.setCanFilter_alone(0x03,ID_STATE3); usleep(10000);
+//	can2serial.setCanFilter_alone(0x04,ID_STATE4); usleep(10000);
 	
-	can2serial.configBaudrate(500);
-	*/
+//	can2serial.configBaudrate(500);
+	
 	can2serial.StartReading();
-	
-	
 		
 	ROS_INFO("System initialization completed");
 	
@@ -163,7 +159,7 @@ void BaseControl::parse_obdCanMsg()
 				state1.act_gear_valid = !(canMsg.data[2]&0x10);
 				state1.vehicle_ready = bool(canMsg.data[2]&0x20);
 				state1.driverless_mode = bool(canMsg.data[2]&0x40);
-				
+				state1.header.stamp = ros::Time::now();
 				state1_pub.publish(state1);
 				break;
 				
@@ -189,7 +185,7 @@ void BaseControl::parse_obdCanMsg()
 				
 				state2.vehicle_speed = speed/i /3.6; //m/s
 				}
-				
+				state2.header.stamp = ros::Time::now();
 				state2_pub.publish(state2);
 				break;
 				
@@ -203,19 +199,24 @@ void BaseControl::parse_obdCanMsg()
 				state3.low_beam = bool(canMsg.data[1]&0x20);
 				state3.brake_light = bool(canMsg.data[2]&0x01);
 				state3.horn = bool(canMsg.data[2]&0x02);
-				
+				state3.header.stamp = ros::Time::now();
 				state3_pub.publish(state3);
 				break;
 				
 			case ID_STATE4:
 				state4.driverless_mode = bool(canMsg.data[0]&0x01);
 				state4.steeringAngle = 1080.0-(canMsg.data[1]*256+canMsg.data[2])*0.1;
+				//std::cout << state4.steeringAngle << std::endl;
+				state4.roadwheelAngle = state4.steeringAngle/g_steering_gearRatio;
 				if(state4.steeringAngle==6553.5)
 					state4.steeringAngle_valid = 0;
 				else
 					state4.steeringAngle_valid = 1;
 				state4.steeringAngle_speed = canMsg.data[3]*4; // deg/s
+				
+				state4.header.stamp = ros::Time::now();
 				state4_pub.publish(state4);
+				state4.key = key2;
 				break;
 				
 			default:
@@ -310,7 +311,7 @@ void BaseControl::Stm32BufferIncomingData(unsigned char *message, unsigned int l
 				bytes_remaining --;
 				if(bytes_remaining == 0)
 				{
-					parse_stm32_msgs(stm32_pkg_buf);
+					parse_stm32_msgs();
 					buffer_index = 0;
 				}
 				break;
@@ -318,34 +319,30 @@ void BaseControl::Stm32BufferIncomingData(unsigned char *message, unsigned int l
 	}// end for
 }
 
-void BaseControl::parse_stm32_msgs(unsigned char *stm32_pkg_buf)
+void BaseControl::parse_stm32_msgs()
 {
-	unsigned char pkgId = stm32_pkg_buf[4];
-	if(pkgId == 0x01)
+	if(stm32_msg1Ptr_->checkNum != generateCheckNum(stm32_msg1Ptr_,ntohs(stm32_msg1Ptr_->pkgLen)+4))
+		return ;
+
+	if(stm32_msg1Ptr_->id == 0x01)
 	{
-		stm32_msg1_ = *(stm32Msg1_t *)stm32_pkg_buf;
-		if(stm32_msg1_.checkNum != generateCheckNum(stm32_pkg_buf,ntohs(stm32_msg1_.pkgLen)+4))
-		{
-			//ROS_ERROR("check error %x != %x",msg->checkNum,generateCheckNum(stm32_pkg_buf,ntohs(msg->pkgLen)+4));
-			return ;
-		}
-			
 		//mutex_.lock();
-		if(stm32_msg1_.is_start && !stm32_msg1_.is_emergency_brake && !is_driverlessMode_)
+		if(stm32_msg1Ptr_->is_start && !stm32_msg1Ptr_->is_emergency_brake && !is_driverlessMode_)
 		{
 			this->setDriverlessMode();//启动无人驾驶模式
-			
+			ROS_INFO("setDriverlessMode ok ^-^");
 			stm32_serial_port_->flushInput();
 			this->is_driverlessMode_ = true;
 		}
-		else if(!stm32_msg1_.is_start && is_driverlessMode_)
+		else if(!stm32_msg1Ptr_->is_start && is_driverlessMode_)
 		{
 			this->is_driverlessMode_ = false;
 			this->exitDriverlessMode();
+			ROS_INFO("exitDriverlessMode ok ^-^");
 		}
-			
-			
-		//printf("is_start:%d\t is_emergency_brake:%d\n",stm32_msg1_.is_start,stm32_msg1_.is_emergency_brake);
+		key1 = stm32_msg1Ptr_->key1;
+		key2 = stm32_msg1Ptr_->key2;
+		
 		//mutex_.unlock();
 	}
 }
@@ -354,58 +351,64 @@ void BaseControl::parse_stm32_msgs(unsigned char *stm32_pkg_buf)
 void BaseControl::setDriverlessMode()
 {
 	ROS_INFO("set driverless mode ing ............");
-	publishDebugMsg(state_detection::Debug::INFO,"enter driverless mode.");
 	
 	*(unsigned long int*)canMsg_cmd1.data = 0;
 	*(unsigned long int*)canMsg_cmd2.data = 0;
 
 	canMsg_cmd1.data[0] = 0x01; //driverless_mode
-	canMsg_cmd2.data[0] = 0x01; //set_gear drive
-	
-	uint16_t steeringAngle = 10800; //middle
-	
-	canMsg_cmd2.data[4] =  uint8_t(steeringAngle / 256);
-	canMsg_cmd2.data[5] = uint8_t(steeringAngle % 256);
-	
-	/*int count = 0;
-	while(ros::ok())
-	{
-		usleep(10000);
-		can2serial.sendCanMsg(canMsg_cmd1);
-		usleep(10000);
-		count ++ ;
-		if(count >50)
-			can2serial.sendCanMsg(canMsg_cmd2);
-		if(count >80)
-			break;
-	}*/
-	
-	while(ros::ok() && state4.driverless_mode==false)
+	//send driverless mode cmd
+	int count =  0;
+	while(ros::ok() )
 	{
 		can2serial.sendCanMsg(canMsg_cmd1);
 		usleep(20000);
+	//when setting the vehicle into driverless mode
+	//the steering will be back to the middle automaticly, and the steer rotate speed is suitable
+	//but if we immdiately send the steering cmd, the steer will rotate very fast, even cause EPS to fail
+	//so we should wait a minute before we send steering cmd
+	//if we just use sleep(x) but not keep cmd being sending ,the driverless system in vehicle may exit
+		if(state4.driverless_mode)
+		{
+			++count;
+			if(count == 5)
+				break;
+		}
 	}
 	
-	size_t count = 0;
-	while(ros::ok() && state1.act_gear != 1)
+	const uint16_t middle_steeringValue = 10800; //middle
+	canMsg_cmd2.data[4] =  uint8_t(middle_steeringValue / 256);
+	canMsg_cmd2.data[5] = uint8_t(middle_steeringValue % 256);
+	
+	for(size_t count = 0; ros::ok() && state1.act_gear != 1; ++count)
+	{
+		if(count%6==0)
+		{
+			canMsg_cmd2.data[0] = 0x00;
+			ROS_INFO("try to set gear failed!!  retrying...");
+		}
+		else
+			canMsg_cmd2.data[0] = 0x01;
+			
+		can2serial.sendCanMsg(canMsg_cmd2);
+		usleep(10000);
+	}
+	canMsg_cmd2.data[0] = 0x01;
+	
+	//to Ensure steering stability at set value
+	for(size_t count=0; count<50; count++)
 	{
 		can2serial.sendCanMsg(canMsg_cmd2);
 		usleep(10000);
-		count ++;
-		
-		if(count%5==0)
-			canMsg_cmd2.data[0] = 0x00;
-		else
-			canMsg_cmd2.data[0] = 0x01;
+		can2serial.sendCanMsg(canMsg_cmd2);
+		usleep(10000);
+		can2serial.sendCanMsg(canMsg_cmd1);
 	}
-	
 	
 	stm32_serial_port_->flushInput();
 }
 void BaseControl::exitDriverlessMode()
 {
 	ROS_INFO("driverless mode exited ............");
-	publishDebugMsg(state_detection::Debug::INFO,"exit driverless mode. ");
 	*(unsigned long int*)canMsg_cmd1.data = 0;
 	*(unsigned long int*)canMsg_cmd2.data = 0;
 
@@ -490,22 +493,12 @@ void BaseControl::callBack2(const little_ant_msgs::ControlCmd2::ConstPtr msg)
 
 	float set_brake = msg->set_brake;
 	
-	static float last_set_steeringAngle = 0;
-	
 	int currentSpeed = state2.vehicle_speed * 3.6;
 	
-	// 事实是：一旦紧急制动 自动驾驶模式已经退出，执行不到这里 
-	/*if(stm32_msg1_.is_emergency_brake)
-	{
-		set_brake = 40.0;
-		set_speed = 0.0;
-	}*/
-	
-	
 	//当设定速度低于当前速度时，制动
-	if(currentSpeed  > 3.0 + msg->set_speed)
+	if(currentSpeed  > 2.0 + msg->set_speed)
 	{
-		set_brake = (currentSpeed - msg->set_speed - 3.0) *3 + 40;
+		set_brake = (currentSpeed - msg->set_speed - 2.0) *3 + 40;
 	}
 	
 	set_brake = (set_brake > msg->set_brake) ? set_brake :msg->set_brake;
@@ -514,10 +507,9 @@ void BaseControl::callBack2(const little_ant_msgs::ControlCmd2::ConstPtr msg)
 		set_speed = 0.0;
 	else if(set_speed > MAX_SPEED-1) 
 		set_speed = MAX_SPEED-1;
-	
 	//increment越大，加速度越大
 	//设定速度越低，加速越快
-	float increment = 2.0/(currentSpeed/5+1);
+	float increment = 3.0/(currentSpeed/5+1);
 	
 	if(set_speed - currentSpeed > increment )
 		set_speed = currentSpeed + increment;
@@ -532,10 +524,17 @@ void BaseControl::callBack2(const little_ant_msgs::ControlCmd2::ConstPtr msg)
 		canMsg_cmd2.data[2] = uint8_t(40 *2.5);
 	else
 		canMsg_cmd2.data[2] = uint8_t(set_brake *2.5);
+		
+	if(key1)
+		canMsg_cmd2.data[2] = uint8_t(40 *2.5);
 	
 	canMsg_cmd2.data[3] = uint8_t(msg->set_accelerate *50);
 	
-	float current_set_steeringAngle = msg->set_steeringAngle;  // -540~540deg
+	static float last_set_steeringAngle = state4.steeringAngle;
+	float current_set_steeringAngle = msg->set_roadWheelAngle * g_steering_gearRatio;  // -540~540deg
+	
+	if(current_set_steeringAngle>480.0) current_set_steeringAngle=480.0;
+	else if(current_set_steeringAngle<-480.0) current_set_steeringAngle =-480.0;
 	
 	if(current_set_steeringAngle - last_set_steeringAngle > max_steering_speed_)
 		current_set_steeringAngle = last_set_steeringAngle + max_steering_speed_;
@@ -544,13 +543,13 @@ void BaseControl::callBack2(const little_ant_msgs::ControlCmd2::ConstPtr msg)
 		
 	last_set_steeringAngle = current_set_steeringAngle;
 	
-	uint16_t steeringAngle = 10800 - last_set_steeringAngle*10 +30; //steering offset
+	uint16_t steeringAngle = 10800 - current_set_steeringAngle*10 +30; //steering offset
 	
 	canMsg_cmd2.data[4] =  uint8_t(steeringAngle / 256);
 	canMsg_cmd2.data[5] = uint8_t(steeringAngle % 256);
 	
 	if(msg->set_emergencyBrake)
-		canMsg_cmd2.data[6] |= 0x10;
+		 canMsg_cmd2.data[6] |= 0x10;
 	else
 		canMsg_cmd2.data[6] &= 0xef;
 		
@@ -566,8 +565,9 @@ void BaseControl::callBack2(const little_ant_msgs::ControlCmd2::ConstPtr msg)
 	stm32_serial_port_->write(send_to_stm32_buf,8);
 }
 
-uint8_t BaseControl::generateCheckNum(const uint8_t* ptr,size_t len)
+uint8_t BaseControl::generateCheckNum(const void* voidPtr,size_t len)
 {
+	const uint8_t *ptr = (const uint8_t *)voidPtr;
     uint8_t sum=0;
 
     for(int i=2; i<len-1 ; i++)
